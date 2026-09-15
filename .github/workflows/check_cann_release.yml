@@ -1,0 +1,83 @@
+name: check-cann-release
+
+on:
+  schedule:
+    - cron: '23 1 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: cann-release-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Check for new CANN releases
+        id: check
+        run: |
+          python3 tools/check_cann_release.py --check > /tmp/report.json
+          cat /tmp/report.json
+          versions=$(jq -r '[.new_versions[].version] | join(" ")' /tmp/report.json)
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+      - name: Open or update notification issue
+        if: steps.check.outputs.versions != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="New CANN releases detected"
+          jq -r --arg run "$RUN_URL" '
+            [
+              "## New CANN versions announced",
+              "",
+              (.new_versions[] |
+                "- **\(.version)** (published \(.publishTime // "unknown"))"),
+              "",
+              "Announced on the [CANN bulletins page](https://www.hiascend.com/productbulletins?tab=CANN)",
+              "but not yet covered by this repository.",
+              "",
+              "Last detected by run \($run)."
+            ] | join("\n")' /tmp/report.json > /tmp/report.md
+          number=$(gh issue list --state open --search "$title in:title" \
+                     --json number -q '.[].number' | head -n1)
+          if [ -n "$number" ]; then
+            gh issue edit "$number" --body-file /tmp/report.md
+          else
+            gh issue create --title "$title" --body-file /tmp/report.md
+          fi
+      - name: Close resolved notification
+        if: steps.check.outputs.versions == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for num in $(gh issue list --state open \
+                         --search "New CANN releases detected in:title" \
+                         --json number -q '.[].number'); do
+            gh issue close "$num" --comment \
+              "All detected versions are now covered by the repository."
+          done
+      - name: Open failure issue
+        if: failure()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="CANN release monitor failed"
+          if [ -n "$(gh issue list --state open --search "$title in:title" --json number -q '.[].number')" ]; then
+            echo "failure issue already open"
+          else
+            gh issue create --title "$title" \
+              --body "The daily bulletin check crashed. Logs: ${RUN_URL}"
+          fi
